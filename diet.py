@@ -20,12 +20,95 @@ from rich.console import Console
 from rich.markdown import Markdown
 
 DB_PATH = os.path.expanduser("~/.local/share/diet-db/diet.db")
+SOURCE_PATH = os.path.abspath(__file__)
+IMPROVEMENTS_LOG = os.path.expanduser("~/.local/share/diet-db/improvements.log")
 
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def ensure_foods_notes_column():
+    """Add notes column to foods table if it doesn't exist."""
+    conn = get_db()
+    cursor = conn.execute("PRAGMA table_info(foods)")
+    columns = [row["name"] for row in cursor.fetchall()]
+    if "notes" not in columns:
+        conn.execute("ALTER TABLE foods ADD COLUMN notes TEXT")
+        conn.commit()
+    conn.close()
+
+
+def ensure_cooking_tables():
+    """Create cooking knowledge base tables if they don't exist."""
+    conn = get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cooking_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            food_name TEXT NOT NULL,
+            food_state TEXT DEFAULT 'raw',
+            method TEXT NOT NULL DEFAULT 'breville',
+            temp_f INTEGER NOT NULL,
+            time_min INTEGER NOT NULL,
+            cut TEXT,
+            amount_g REAL,
+            notes TEXT,
+            confidence TEXT DEFAULT 'estimated',
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cooking_combos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            method TEXT NOT NULL DEFAULT 'breville',
+            temp_f INTEGER NOT NULL,
+            total_time_min INTEGER NOT NULL,
+            outcome TEXT,
+            notes TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS combo_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            combo_id INTEGER NOT NULL REFERENCES cooking_combos(id) ON DELETE CASCADE,
+            food_name TEXT NOT NULL,
+            food_state TEXT DEFAULT 'raw',
+            amount_g REAL,
+            cut TEXT,
+            item_outcome TEXT,
+            notes TEXT
+        )
+    """)
+    # Seed known data points if tables are empty
+    count = conn.execute("SELECT COUNT(*) FROM cooking_records").fetchone()[0]
+    if count == 0:
+        conn.executemany(
+            "INSERT INTO cooking_records (food_name, food_state, method, temp_f, time_min, amount_g, notes, confidence, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("chicken breast", "raw", "breville", 400, 30, 265, "on tray with veg", "tested", "2026-02-28"),
+                ("broccoli", "raw", "breville", 400, 30, 165, "charred edges fine", "tested", "2026-02-28"),
+                ("potato", "raw", "breville", 400, 30, 120, None, "tested", "2026-02-28"),
+                ("burger", "frozen", "breville", 400, 17, 226, "Costco spindle pack, thin patties, x2", "tested", "2026-02-28"),
+            ],
+        )
+        cursor = conn.execute(
+            "INSERT INTO cooking_combos (method, temp_f, total_time_min, outcome, notes, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("breville", 400, 30, "great", "chicken breast + broccoli + potato, one tray", "2026-02-28"),
+        )
+        combo_id = cursor.lastrowid
+        conn.executemany(
+            "INSERT INTO combo_items (combo_id, food_name, food_state, amount_g, item_outcome) VALUES (?, ?, ?, ?, ?)",
+            [
+                (combo_id, "chicken breast", "raw", 265, "perfect"),
+                (combo_id, "broccoli", "raw", 165, "perfect"),
+                (combo_id, "potato", "raw", 120, "perfect"),
+            ],
+        )
+    conn.commit()
+    conn.close()
 
 
 def ensure_extra_tables():
@@ -121,12 +204,18 @@ async def lookup_food(args):
         return {"content": [{"type": "text", "text": f"No food found matching '{query}'"}]}
     results = []
     for r in rows:
-        results.append({
+        entry = {
             "name": r["name"], "fat": r["fat"], "carb": r["carb"],
             "prot": r["prot"], "fiber": r["fiber"], "gram": r["gram"],
             "cal": r["cal"], "iron": r["iron"], "sugar": r["sugar"],
             "sodium": r["sodium"],
-        })
+        }
+        try:
+            if r["notes"]:
+                entry["notes"] = r["notes"]
+        except (IndexError, KeyError):
+            pass
+        results.append(entry)
     return {"content": [{"type": "text", "text": json.dumps(results, indent=2)}]}
 
 
@@ -141,20 +230,26 @@ async def list_all_foods(args):
     conn.close()
     if not rows:
         return {"content": [{"type": "text", "text": "Database is empty."}]}
-    results = [dict(r) for r in rows]
+    results = []
+    for r in rows:
+        entry = dict(r)
+        if entry.get("notes") is None:
+            entry.pop("notes", None)
+        results.append(entry)
     return {"content": [{"type": "text", "text": json.dumps(results, indent=2)}]}
 
 
 @tool(
     "add_food",
-    "Add or update a food in the diet database. All nutrition values are per 100g.",
-    {"name": str, "fat": float, "carb": float, "prot": float, "fiber": float, "gram": float, "cal": float, "iron": float, "sugar": float, "sodium": float},
+    "Add or update a food in the diet database. All nutrition values are per 100g. Optional notes field for serving size info (e.g. '1 burger = 113g') or other context.",
+    {"name": str, "fat": float, "carb": float, "prot": float, "fiber": float, "gram": float, "cal": float, "iron": float, "sugar": float, "sodium": float, "notes": str},
 )
 async def add_food(args):
     conn = get_db()
+    notes = args.get("notes") or None
     conn.execute(
-        "INSERT OR REPLACE INTO foods (name, fat, carb, prot, fiber, gram, cal, iron, sugar, sodium) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (args["name"], args["fat"], args["carb"], args["prot"], args["fiber"], args["gram"], args["cal"], args["iron"], args["sugar"], args["sodium"]),
+        "INSERT OR REPLACE INTO foods (name, fat, carb, prot, fiber, gram, cal, iron, sugar, sodium, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (args["name"], args["fat"], args["carb"], args["prot"], args["fiber"], args["gram"], args["cal"], args["iron"], args["sugar"], args["sodium"], notes),
     )
     conn.commit()
     conn.close()
@@ -422,6 +517,246 @@ async def delete_weight_log(args):
     return {"content": [{"type": "text", "text": f"No weight entry with ID {args['id']} found."}]}
 
 
+@tool(
+    "read_own_source",
+    "Read the diet CLI's own Python source code (diet.py). Use this to analyze current tools, logic, and system prompt before proposing improvements.",
+    {},
+)
+async def read_own_source(args):
+    try:
+        with open(SOURCE_PATH, "r") as f:
+            source = f.read()
+        return {"content": [{"type": "text", "text": source}]}
+    except Exception as e:
+        return {"content": [{"type": "text", "text": f"Error reading source: {e}"}]}
+
+
+@tool(
+    "edit_own_source",
+    "Apply a surgical edit to diet.py. Provide old_string (exact text to find) and new_string (replacement). "
+    "The old_string must match EXACTLY one location in the file (including whitespace/indentation). "
+    "For multiple edits, call this tool multiple times. Changes take effect on next restart.",
+    {"old_string": str, "new_string": str, "description": str},
+)
+async def edit_own_source(args):
+    from datetime import datetime
+    try:
+        with open(SOURCE_PATH, "r") as f:
+            source = f.read()
+        old = args["old_string"]
+        new = args["new_string"]
+        count = source.count(old)
+        if count == 0:
+            return {"content": [{"type": "text", "text": f"Error: old_string not found in source. Read the source first with read_own_source to get exact text."}]}
+        if count > 1:
+            return {"content": [{"type": "text", "text": f"Error: old_string matches {count} locations. Provide more surrounding context to uniquely identify the edit location."}]}
+        updated = source.replace(old, new, 1)
+        with open(SOURCE_PATH, "w") as f:
+            f.write(updated)
+        os.makedirs(os.path.dirname(IMPROVEMENTS_LOG), exist_ok=True)
+        with open(IMPROVEMENTS_LOG, "a") as f:
+            f.write(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M')}] {args['description']}\n")
+        return {"content": [{"type": "text", "text": f"Edit applied and logged: {args['description']}\nRestart the session to activate changes."}]}
+    except Exception as e:
+        return {"content": [{"type": "text", "text": f"Error editing source: {e}"}]}
+
+
+@tool(
+    "get_improvement_log",
+    "Read the history of self-improvements made to diet.py. Shows timestamped descriptions of all past code changes.",
+    {},
+)
+async def get_improvement_log(args):
+    try:
+        if not os.path.exists(IMPROVEMENTS_LOG):
+            return {"content": [{"type": "text", "text": "No improvements logged yet."}]}
+        with open(IMPROVEMENTS_LOG, "r") as f:
+            log = f.read().strip()
+        if not log:
+            return {"content": [{"type": "text", "text": "No improvements logged yet."}]}
+        return {"content": [{"type": "text", "text": log}]}
+    except Exception as e:
+        return {"content": [{"type": "text", "text": f"Error reading improvement log: {e}"}]}
+
+
+@tool(
+    "save_cooking_time",
+    "Store an individual food's cooking record. Allows multiple records per food for different states/cuts/amounts.",
+    {"food_name": str, "method": str, "temp_f": int, "time_min": int, "food_state": str, "cut": str, "amount_g": float, "notes": str, "confidence": str},
+)
+async def save_cooking_time(args):
+    from datetime import datetime
+    ensure_cooking_tables()
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO cooking_records (food_name, food_state, method, temp_f, time_min, cut, amount_g, notes, confidence, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (args["food_name"].lower().strip(),
+         args.get("food_state") or "raw",
+         args.get("method") or "breville",
+         args["temp_f"],
+         args["time_min"],
+         args.get("cut") or None,
+         args.get("amount_g") or None,
+         args.get("notes") or None,
+         args.get("confidence") or "estimated",
+         datetime.now().strftime("%Y-%m-%d")),
+    )
+    conn.commit()
+    conn.close()
+    return {"content": [{"type": "text", "text": f"Saved cooking record: {args['food_name']} — {args['time_min']} min at {args['temp_f']}°F ({args.get('confidence', 'estimated')})"}]}
+
+
+@tool(
+    "lookup_cooking_times",
+    "Query cooking data for one or more foods. Returns individual records and a computed combo suggestion (max of individual times). Also checks past combo sessions involving these foods.",
+    {"food_names": str, "method": str, "temp_f": int},
+)
+async def lookup_cooking_times(args):
+    ensure_cooking_tables()
+    conn = get_db()
+    names = [n.strip().lower() for n in args["food_names"].split(",")]
+    method = args.get("method") or "breville"
+    temp_f = args.get("temp_f") or 400
+
+    results = {}
+    for name in names:
+        rows = conn.execute(
+            "SELECT * FROM cooking_records WHERE food_name LIKE ? AND method = ? ORDER BY confidence DESC, created_at DESC",
+            (f"%{name}%", method),
+        ).fetchall()
+        results[name] = [dict(r) for r in rows]
+
+    # Find past combo sessions involving any of these foods
+    combo_matches = []
+    for name in names:
+        combos = conn.execute(
+            """SELECT cc.*, ci.food_name, ci.food_state, ci.amount_g, ci.cut, ci.item_outcome
+               FROM cooking_combos cc
+               JOIN combo_items ci ON ci.combo_id = cc.id
+               WHERE ci.food_name LIKE ? AND cc.method = ?
+               ORDER BY cc.created_at DESC LIMIT 10""",
+            (f"%{name}%", method),
+        ).fetchall()
+        for c in combos:
+            combo_matches.append(dict(c))
+    conn.close()
+
+    # Compute combo suggestion
+    bottleneck = None
+    max_time = 0
+    food_times = {}
+    warnings = []
+    for name, records in results.items():
+        # Filter to matching temp (or close)
+        matching = [r for r in records if abs(r["temp_f"] - temp_f) <= 25]
+        if matching:
+            best = matching[0]
+            food_times[name] = best["time_min"]
+            if best["time_min"] > max_time:
+                max_time = best["time_min"]
+                bottleneck = name
+        else:
+            food_times[name] = None
+
+    for name, t in food_times.items():
+        if t is not None and max_time > 0 and t < max_time * 0.6:
+            warnings.append(f"{name} ({t} min) may overcook at {max_time} min — it needs significantly less time")
+
+    output = {
+        "individual_records": results,
+        "combo_suggestion": {
+            "suggested_time_min": max_time if max_time > 0 else None,
+            "bottleneck": bottleneck,
+            "food_times": food_times,
+            "warnings": warnings,
+        },
+        "past_combo_sessions": combo_matches,
+    }
+    return {"content": [{"type": "text", "text": json.dumps(output, indent=2)}]}
+
+
+@tool(
+    "log_cooking_session",
+    "Record a completed cooking session with combo details and per-item outcomes. Items is a JSON array of {food_name, food_state, amount_g, cut, item_outcome, notes}.",
+    {"method": str, "temp_f": int, "total_time_min": int, "items": str, "outcome": str, "notes": str},
+)
+async def log_cooking_session(args):
+    from datetime import datetime
+    ensure_cooking_tables()
+    conn = get_db()
+    cursor = conn.execute(
+        "INSERT INTO cooking_combos (method, temp_f, total_time_min, outcome, notes, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (args.get("method") or "breville",
+         args["temp_f"],
+         args["total_time_min"],
+         args.get("outcome") or None,
+         args.get("notes") or None,
+         datetime.now().strftime("%Y-%m-%d")),
+    )
+    combo_id = cursor.lastrowid
+    items = json.loads(args["items"])
+    for item in items:
+        conn.execute(
+            "INSERT INTO combo_items (combo_id, food_name, food_state, amount_g, cut, item_outcome, notes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (combo_id,
+             item["food_name"].lower().strip(),
+             item.get("food_state", "raw"),
+             item.get("amount_g"),
+             item.get("cut"),
+             item.get("item_outcome"),
+             item.get("notes")),
+        )
+        # Auto-update confidence to "tested" for matching cooking_records
+        conn.execute(
+            "UPDATE cooking_records SET confidence = 'tested' WHERE food_name LIKE ? AND method = ? AND confidence = 'estimated'",
+            (f"%{item['food_name'].lower().strip()}%", args.get("method") or "breville"),
+        )
+    conn.commit()
+    conn.close()
+    item_names = ", ".join(i["food_name"] for i in items)
+    return {"content": [{"type": "text", "text": f"Logged cooking session #{combo_id}: {item_names} — {args['total_time_min']} min at {args['temp_f']}°F ({args.get('outcome', 'no rating')})"}]}
+
+
+@tool(
+    "get_cooking_history",
+    "Browse past cooking sessions. Optionally filter by food_name. Returns combo sessions with their items and outcomes.",
+    {"food_name": str, "recent": int},
+)
+async def get_cooking_history(args):
+    ensure_cooking_tables()
+    conn = get_db()
+    limit = args.get("recent") or 10
+    food_filter = args.get("food_name", "").strip().lower()
+
+    if food_filter:
+        combos = conn.execute(
+            """SELECT DISTINCT cc.* FROM cooking_combos cc
+               JOIN combo_items ci ON ci.combo_id = cc.id
+               WHERE ci.food_name LIKE ?
+               ORDER BY cc.created_at DESC LIMIT ?""",
+            (f"%{food_filter}%", limit),
+        ).fetchall()
+    else:
+        combos = conn.execute(
+            "SELECT * FROM cooking_combos ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    results = []
+    for combo in combos:
+        c = dict(combo)
+        items = conn.execute(
+            "SELECT * FROM combo_items WHERE combo_id = ?", (c["id"],)
+        ).fetchall()
+        c["items"] = [dict(i) for i in items]
+        results.append(c)
+    conn.close()
+
+    if not results:
+        return {"content": [{"type": "text", "text": "No cooking sessions logged yet."}]}
+    return {"content": [{"type": "text", "text": json.dumps(results, indent=2)}]}
+
+
 SYSTEM_PROMPT = """You are a diet nutrition assistant. You have access to a SQLite food database via tools.
 
 When the user asks about a food with a specific amount (e.g. "150g red bell peppers"):
@@ -438,6 +773,33 @@ to provide accurate per-100g values and say something like:
 "I don't have [food] in your database. Want me to add it? Here's what I'd use (per 100g): ..."
 Then if the user confirms (says yes, sure, ok, y, etc.), add it with add_food and answer their original question.
 If the user's query included an amount, after adding, also provide the scaled nutrition for their requested amount.
+
+FOOD NOTES:
+Foods can have a "notes" field for useful context like:
+- Serving size equivalents (e.g. "1 burger = 113g", "1 large egg = 50g")
+- Brand info (e.g. "Costco Kirkland brand")
+- Preparation notes (e.g. "raw weight, loses ~25% when cooked")
+When looking up a food that has notes, display the notes to the user.
+When adding a food, include notes if the user provides serving size info or other context.
+
+COOKING TIMES:
+You have a cooking_times knowledge base that accumulates data over time. Use it to give
+evidence-based cooking recommendations instead of guessing.
+
+WHEN THE USER ASKS HOW TO COOK SOMETHING:
+1. Call lookup_cooking_times with the foods and method
+2. If records exist: use them. Combo time = max of individual times (one tray, no flipping).
+3. If no records: estimate from your knowledge, clearly mark as estimated, and offer to save.
+4. If a food's individual time is much shorter than the combo time, note it may overcook
+   but respect the user's "one shot" preference — just mention it.
+5. Check past combo sessions for these foods to see if there are outcome notes.
+
+AFTER COOKING:
+If the user reports how it went ("that was perfect", "carrots were undercooked"), log it:
+1. Call log_cooking_session with the combo details and per-item outcomes
+2. If an individual food's time estimate was wrong, save a corrected cooking_record
+
+The user's defaults: method="breville", temp_f=400, no flipping, no staggering.
 
 When the user asks "how many g of X to equate Yg" or "to reach Yg" or similar, they mean:
 "How many grams of food X do I need so that a specific macro (usually carbs) totals Yg?"
@@ -509,7 +871,35 @@ WHEN TO USE GOALS:
 
 Always show nutrition in a clear, readable format. Keep responses concise.
 All values in the database are per 100g. The gram column is always 100 (reference serving size).
-Iron and sodium are also in grams (not mg)."""
+Iron and sodium are also in grams (not mg).
+
+SELF-IMPROVEMENT:
+You can read and modify your own source code (diet.py) using surgical edits. This lets you fix bugs,
+add new tools, improve logic, and evolve your capabilities over time.
+
+AUTONOMY MODES (check preferences for key "self_improvement_mode" under category "general"):
+- "ask_always": Always explain the proposed change and wait for user approval before modifying code.
+- "auto_minor" (DEFAULT if no preference set): Auto-apply minor fixes (bug fixes, small tweaks,
+  prompt improvements) with a brief explanation. Ask before major changes (new tools, architectural changes).
+- "auto_all": Apply all improvements automatically, just inform the user what changed.
+
+HOW TO APPLY EDITS:
+1. First check get_preferences for "self_improvement_mode" to know your autonomy level
+2. Read your source with read_own_source
+3. Briefly explain the proposed change to the user
+4. Based on autonomy mode, either ask or proceed
+5. Use edit_own_source with exact old_string/new_string pairs — one edit per tool call
+6. NEVER rewrite the entire file. Only change the specific lines that need modification.
+7. Tell the user to restart the session to activate changes
+8. Continue the current conversation normally — don't stop helping just because you updated code
+
+WHAT NOT TO MODIFY (regardless of autonomy mode):
+- Never remove existing tools without the user explicitly asking
+- Never change database schema without asking
+- Never break the self-improvement tools themselves
+- Never modify the core client/server setup in a way that could prevent startup
+
+Check get_improvement_log before proposing changes to avoid re-suggesting past improvements."""
 
 
 async def send_and_print(client, console, query):
@@ -530,11 +920,13 @@ async def main():
     time_context = f"\nCurrent date: {now.strftime('%Y-%m-%d')}\nCurrent time: {now.strftime('%H:%M')}\n"
 
     goals_context = load_goals_context()
+    ensure_foods_notes_column()
+    ensure_cooking_tables()
 
     server = create_sdk_mcp_server(
         name="diet",
         version="1.0.0",
-        tools=[lookup_food, list_all_foods, add_food, delete_food, log_meal, get_meal_log, delete_meal_log, save_preference, get_preferences, delete_preference, save_goals, get_goals, log_weight, get_weight_log, delete_weight_log],
+        tools=[lookup_food, list_all_foods, add_food, delete_food, log_meal, get_meal_log, delete_meal_log, save_preference, get_preferences, delete_preference, save_goals, get_goals, log_weight, get_weight_log, delete_weight_log, read_own_source, edit_own_source, get_improvement_log, save_cooking_time, lookup_cooking_times, log_cooking_session, get_cooking_history],
     )
 
     console = Console()
@@ -559,7 +951,15 @@ async def main():
                 "mcp__diet__log_weight",
                 "mcp__diet__get_weight_log",
                 "mcp__diet__delete_weight_log",
+                "mcp__diet__read_own_source",
+                "mcp__diet__edit_own_source",
+                "mcp__diet__get_improvement_log",
+                "mcp__diet__save_cooking_time",
+                "mcp__diet__lookup_cooking_times",
+                "mcp__diet__log_cooking_session",
+                "mcp__diet__get_cooking_history",
             ],
+            model="claude-sonnet-4-6",
             permission_mode="bypassPermissions",
             max_turns=15,
         )
